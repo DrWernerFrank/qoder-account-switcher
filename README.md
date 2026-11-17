@@ -23,11 +23,20 @@ Before every switch or logout the current login is auto-saved back to its profil
 ## Features
 
 - Current account display (name, email, token expiry)
+- Live **plan and remaining credits** per profile, read from Qoder's API
+- **Daily 100-credit claim status** per profile (claimable / claimed / not offered)
 - Save / switch / delete account profiles
 - One-click "login new account via browser" flow
 - Copy the current API access token to clipboard
 - Login validity (refresh-token expiry) shown per profile
 - Double-click a profile to switch
+- DPI-aware, crisp text on scaled displays (and when moving between monitors)
+
+## Daily 100 credits
+
+Qoder International gives every individual account (Free, Pro Trial, Lite, Pro, Pro+, Ultra) 100 Credits per day, claimed manually in the desktop app via **Usage panel → gift icon**. The claim window is 10:00–10:00 Singapore time; each claim is valid 30 days and lands in Add-on Credits.
+
+Qoder delivers that reward as a campaign (`actionType: CLAIM_BENEFIT`) and eligibility is decided server-side. If a profile shows **not offered** in the Daily 100 column, the account has no claimable daily campaign right now — the app itself will not show the gift entry either. Switching accounts locally cannot create it; ask Qoder support (contact@qoder.com) if it persists.
 
 ## Requirements
 
@@ -57,7 +66,7 @@ python qoder_switcher.pyw
 
 - Saved profiles live in `profiles/` next to the script and contain **real login tokens**. The folder is gitignored — never commit or share it.
 - The blobs stay encrypted with your Windows user's DPAPI key. They cannot be decrypted on another PC or by another Windows user.
-- The tool only reads/writes files belonging to your own Qoder installation; it makes no network requests.
+- The tool only reads/writes files belonging to your own Qoder installation. Its only network traffic is two read-only `GET`s to `openapi.qoder.sh` (account usage and campaigns) using the token of the account you already have saved — nothing is sent anywhere else.
 
 ## License
 

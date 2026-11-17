@@ -13,6 +13,8 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -25,6 +27,33 @@ LOCAL_STATE = APPDATA / "Local State"
 QODER_EXE = Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Qoder" / "Qoder.exe"
 PROFILES_DIR = Path(__file__).parent / "profiles"
 NO_WINDOW = 0x08000000
+API_HOST = "https://openapi.qoder.sh"
+BASE_W, BASE_H = 760, 520
+
+
+def enable_dpi_awareness():
+    """Render at native resolution instead of letting Windows stretch us.
+
+    Without this, on any display scaling above 100% the whole window is
+    bitmap-scaled and every glyph comes out soft.
+    """
+    try:  # Windows 10 1703+: per-monitor v2
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except (AttributeError, OSError):
+        pass
+    try:  # Windows 8.1+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except (AttributeError, OSError):
+        pass
+    try:  # Vista+
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
+
+
+enable_dpi_awareness()
 
 
 # ---------- crypto / auth ----------
@@ -72,6 +101,81 @@ def fmt_expiry(value):
         return dt.astimezone().strftime("%Y-%m-%d %H:%M")
     except ValueError:
         return str(value)
+
+
+# ---------- live account state ----------
+
+def api_get(path: str, token: str, timeout=15):
+    req = urllib.request.Request(
+        API_HOST + path,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Cosy-ClientType": "10",
+            "Cosy-Version": "0.3.4",
+            "User-Agent": "Qoder",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def quota_state(auth_path: Path):
+    """Ask Qoder's server what this account is actually entitled to.
+
+    The daily/free credits are granted server-side against a per-machine risk
+    identity, so this is the only honest source of truth. Read-only GETs.
+    """
+    auth = read_auth(auth_path)
+    token = auth.get("token")
+    if not token:
+        return {"err": "no access token"}
+    state = {"plan": "?", "remaining": None, "total": None,
+             "exceeded": None, "campaign": "?", "daily": "?", "err": None}
+    try:
+        usage = api_get("/sash/api/v2/me/usage", token).get("qoderUsage") or {}
+        addon = usage.get("addOnQuota") or {}
+        plan_q = usage.get("userQuota") or {}
+        remaining = addon.get("remaining")
+        total = addon.get("total")
+        if remaining is None:  # no add-on pack -> plan quota is the only balance
+            remaining, total = plan_q.get("remaining"), plan_q.get("total")
+        user_type = usage.get("userType") or "?"
+        state.update({
+            "plan": "Free" if user_type == "personal_standard" else user_type,
+            "remaining": remaining, "total": total,
+            "exceeded": usage.get("isQuotaExceeded"),
+        })
+    except urllib.error.HTTPError as e:
+        state["err"] = "401 expired" if e.code in (401, 403) else f"HTTP {e.code}"
+    except Exception as e:
+        state["err"] = type(e).__name__
+    try:
+        camp = api_get("/sash/api/v1/me/campaigns", token)
+        items = camp.get("campaigns") or []
+        status = items[0].get("claimStatus") if items else None
+        state["campaign"] = "claimable" if camp.get("claimable") else (status or "-").lower()
+        # The daily 100-credit reward is delivered as a CLAIM_BENEFIT campaign.
+        benefit = [c for c in items if c.get("actionType") == "CLAIM_BENEFIT"]
+        marks = [(c.get("claimStatus") or "").upper() for c in benefit]
+        if "CLAIMABLE" in marks:
+            state["daily"] = "claimable"
+        elif marks:
+            state["daily"] = "claimed"
+        else:
+            state["daily"] = "not offered"
+    except Exception:
+        pass
+    return state
+
+
+def fmt_credit(state):
+    if state.get("err"):
+        return state["err"]
+    rem, total = state.get("remaining"), state.get("total")
+    if rem is None:
+        return "?"
+    return f"{rem}/{total}" if total else str(rem)
 
 
 # ---------- profiles ----------
@@ -170,13 +274,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Qoder Account Switcher")
-        dpi = self.winfo_fpixels("1i")
-        scale = dpi / 96.0
-        self.tk.call("tk", "scaling", dpi / 72.0)
-        self.geometry(f"{int(720 * scale)}x{int(520 * scale)}")
-        self.minsize(int(620 * scale), int(440 * scale))
         self.busy = False
         self.current = None
+        self.quota = {}          # email -> state dict from the server
+        self.quota_busy = False
+        self._dpi = None
+        self._apply_scaling()
+        self.bind("<Configure>", self._on_dpi_change)
 
         for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
             try:
@@ -187,19 +291,21 @@ class App(tk.Tk):
         style = ttk.Style(self)
         style.theme_use("vista")
         style.configure(".", font=("Segoe UI", 10))
-        style.configure("TButton", padding=(int(10 * scale), int(6 * scale)))
+        style.configure("TButton", padding=(int(10 * self.scale), int(6 * self.scale)))
         style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
-        style.configure("Treeview", font=("Segoe UI", 10), rowheight=int(30 * scale))
+        style.configure("Treeview", font=("Segoe UI", 10), rowheight=int(30 * self.scale))
         style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"),
-                        padding=(4, int(6 * scale)))
+                        padding=(4, int(6 * self.scale)))
 
-        top = ttk.LabelFrame(self, text=" Current account ", padding=12)
-        top.pack(fill="x", padx=12, pady=(12, 6))
+        top = ttk.LabelFrame(self, text=" Current account ", padding=10)
+        top.pack(fill="x", padx=10, pady=(10, 5))
         self.cur_label = ttk.Label(top, text="...", font=("Segoe UI", 12, "bold"))
         self.cur_label.pack(anchor="w")
-        self.cur_detail = ttk.Label(top, text="", foreground="#555",
-                                    font=("Segoe UI", 10))
+        self.cur_detail = ttk.Label(top, text="", foreground="#555", font=("Segoe UI", 10))
         self.cur_detail.pack(anchor="w", pady=(2, 0))
+        self.cur_credit = ttk.Label(top, text="Credits: checking...", foreground="#555",
+                                    font=("Segoe UI", 10))
+        self.cur_credit.pack(anchor="w")
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=10, pady=5)
@@ -209,16 +315,20 @@ class App(tk.Tk):
         self.b_new.pack(side="left", padx=6)
         self.b_token = ttk.Button(btns, text="Copy API token", command=self.on_copy_token)
         self.b_token.pack(side="left")
+        self.b_quota = ttk.Button(btns, text="Check credits", command=lambda: self.fetch_quota(force=True))
+        self.b_quota.pack(side="left", padx=6)
         ttk.Button(btns, text="Refresh", command=self.refresh).pack(side="right")
 
         mid = ttk.LabelFrame(self, text=" Saved accounts ", padding=10)
         mid.pack(fill="both", expand=True, padx=10, pady=5)
-        cols = ("email", "name", "saved", "expires")
+        cols = ("email", "name", "plan", "credits", "daily", "saved", "expires")
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=8)
-        for c, w, t in (("email", 240, "Email"), ("name", 130, "Name"),
-                        ("saved", 120, "Saved"), ("expires", 130, "Login valid until")):
+        for c, w, t in (("email", 205, "Email"), ("name", 85, "Name"),
+                        ("plan", 55, "Plan"), ("credits", 80, "Credits"),
+                        ("daily", 85, "Daily 100"), ("saved", 90, "Saved"),
+                        ("expires", 105, "Valid until")):
             self.tree.heading(c, text=t)
-            self.tree.column(c, width=int(w * scale), anchor="w")
+            self.tree.column(c, width=int(w * self.scale), anchor="w")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<Double-1>", lambda e: self.on_switch())
 
@@ -237,13 +347,47 @@ class App(tk.Tk):
 
     # -- helpers --
 
+    def _apply_scaling(self):
+        """Scale the window and point-sized fonts to the monitor's real DPI."""
+        try:
+            dpi = float(self.winfo_fpixels("1i"))
+        except (tk.TclError, ValueError):
+            dpi = 96.0
+        self._dpi = dpi
+        self.tk.call("tk", "scaling", dpi / 72.0)
+        self.scale = dpi / 96.0
+        scale = self.scale
+        self.geometry(f"{int(BASE_W * scale)}x{int(BASE_H * scale)}")
+        self.minsize(int(BASE_W * 0.9 * scale), int(BASE_H * 0.85 * scale))
+
+    def _on_dpi_change(self, event):
+        """Re-derive scaling when the window lands on a monitor with other DPI."""
+        if event.widget is not self or not hasattr(self, "tree"):
+            return
+        try:
+            dpi = float(self.winfo_fpixels("1i"))
+        except (tk.TclError, ValueError):
+            return
+        if self._dpi is None or abs(dpi - self._dpi) < 6:
+            return
+        self._dpi = dpi
+        self.scale = dpi / 96.0
+        self.tk.call("tk", "scaling", dpi / 72.0)
+        self._resize_columns()
+
+    def _resize_columns(self):
+        widths = {"email": 205, "name": 85, "plan": 55, "credits": 80,
+                  "daily": 85, "saved": 90, "expires": 105}
+        for c, w in widths.items():
+            self.tree.column(c, width=int(w * self.scale))
+
     def set_status(self, text):
         self.status.config(text=text)
 
     def set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy else "normal"
-        for b in (self.b_save, self.b_new, self.b_token, self.b_switch, self.b_delete):
+        for b in (self.b_save, self.b_new, self.b_token, self.b_quota, self.b_switch, self.b_delete):
             b.config(state=state)
 
     def run_bg(self, fn):
@@ -275,11 +419,65 @@ class App(tk.Tk):
             self.tree.delete(item)
         cur_email = (self.current or {}).get("user", {}).get("email")
         for p in list_profiles():
+            q = self.quota.get(p["email"]) or {}
             tag = "current" if p["email"] == cur_email else ""
             self.tree.insert("", "end", iid=p["email"],
-                             values=(p["email"], p["name"], p["saved"], p["refresh_expires"]),
+                             values=(p["email"], p["name"], q.get("plan") or "...",
+                                     fmt_credit(q) if q else "...", q.get("daily") or "...",
+                                     p["saved"], p["refresh_expires"]),
                              tags=(tag,))
         self.tree.tag_configure("current", background="#e8f5e9")
+        self.fetch_quota()
+
+    def fetch_quota(self, force=False):
+        """Read plan + remaining credits for every saved profile from Qoder's API."""
+        if self.quota_busy:
+            if force:
+                self.set_status("Credit check already running...")
+            return
+        self.quota_busy = True
+        profiles = list_profiles()
+        has_current = bool(self.current and self.current.get("user", {}).get("email"))
+
+        def job():
+            results = {}
+            for p in profiles:
+                try:
+                    results[p["email"]] = quota_state(p["dir"] / "auth.v1.dat")
+                except Exception as e:
+                    results[p["email"]] = {"err": type(e).__name__}
+            cur = None
+            if has_current:
+                try:
+                    cur = quota_state(AUTH_FILE)
+                except Exception as e:
+                    cur = {"err": type(e).__name__}
+            self.after(0, lambda: self.apply_quota(results, cur))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def apply_quota(self, results, cur):
+        self.quota.update(results)
+        for email, st in results.items():
+            if self.tree.exists(email):
+                self.tree.set(email, "plan", st.get("plan") or "?")
+                self.tree.set(email, "credits", fmt_credit(st))
+                self.tree.set(email, "daily", st.get("daily") or "?")
+        if cur is not None:
+            if cur.get("err"):
+                self.cur_credit.config(text=f"Credits: cannot read ({cur['err']})", foreground="#b00020")
+            else:
+                notes = []
+                if cur.get("exceeded"):
+                    notes.append("quota exceeded")
+                if cur.get("campaign") not in (None, "?", "-", "claimed"):
+                    notes.append(f"campaign {cur['campaign']}")
+                text = f"Credits: {fmt_credit(cur)}  ({cur.get('plan')})"
+                if notes:
+                    text += "  — " + ", ".join(notes)
+                self.cur_credit.config(text=text, foreground="#b00020" if cur.get("exceeded") else "#555")
+        self.quota_busy = False
+        self.set_status("Credits fetched from Qoder's server (read-only).")
 
     def selected_email(self):
         sel = self.tree.selection()
@@ -373,14 +571,6 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    # crisp text on high-DPI displays; must run before the Tk window exists
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
     if not QODER_EXE.exists():
         messagebox.showerror("Qoder not found", f"Expected Qoder at:\n{QODER_EXE}")
         sys.exit(1)
