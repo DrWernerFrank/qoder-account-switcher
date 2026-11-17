@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -169,20 +170,36 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Qoder Account Switcher")
-        self.geometry("640x480")
-        self.minsize(560, 400)
+        dpi = self.winfo_fpixels("1i")
+        scale = dpi / 96.0
+        self.tk.call("tk", "scaling", dpi / 72.0)
+        self.geometry(f"{int(720 * scale)}x{int(520 * scale)}")
+        self.minsize(int(620 * scale), int(440 * scale))
         self.busy = False
         self.current = None
 
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                tkfont.nametofont(name).configure(family="Segoe UI", size=10)
+            except tk.TclError:
+                pass
+
         style = ttk.Style(self)
         style.theme_use("vista")
+        style.configure(".", font=("Segoe UI", 10))
+        style.configure("TButton", padding=(int(10 * scale), int(6 * scale)))
+        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+        style.configure("Treeview", font=("Segoe UI", 10), rowheight=int(30 * scale))
+        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"),
+                        padding=(4, int(6 * scale)))
 
-        top = ttk.LabelFrame(self, text=" Current account ", padding=10)
-        top.pack(fill="x", padx=10, pady=(10, 5))
-        self.cur_label = ttk.Label(top, text="...", font=("Segoe UI", 10, "bold"))
+        top = ttk.LabelFrame(self, text=" Current account ", padding=12)
+        top.pack(fill="x", padx=12, pady=(12, 6))
+        self.cur_label = ttk.Label(top, text="...", font=("Segoe UI", 12, "bold"))
         self.cur_label.pack(anchor="w")
-        self.cur_detail = ttk.Label(top, text="", foreground="#555")
-        self.cur_detail.pack(anchor="w")
+        self.cur_detail = ttk.Label(top, text="", foreground="#555",
+                                    font=("Segoe UI", 10))
+        self.cur_detail.pack(anchor="w", pady=(2, 0))
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=10, pady=5)
@@ -198,10 +215,10 @@ class App(tk.Tk):
         mid.pack(fill="both", expand=True, padx=10, pady=5)
         cols = ("email", "name", "saved", "expires")
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=8)
-        for c, w, t in (("email", 220, "Email"), ("name", 120, "Name"),
-                        ("saved", 110, "Saved"), ("expires", 110, "Login valid until")):
+        for c, w, t in (("email", 240, "Email"), ("name", 130, "Name"),
+                        ("saved", 120, "Saved"), ("expires", 130, "Login valid until")):
             self.tree.heading(c, text=t)
-            self.tree.column(c, width=w, anchor="w")
+            self.tree.column(c, width=int(w * scale), anchor="w")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<Double-1>", lambda e: self.on_switch())
 
@@ -356,6 +373,14 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    # crisp text on high-DPI displays; must run before the Tk window exists
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
     if not QODER_EXE.exists():
         messagebox.showerror("Qoder not found", f"Expected Qoder at:\n{QODER_EXE}")
         sys.exit(1)
